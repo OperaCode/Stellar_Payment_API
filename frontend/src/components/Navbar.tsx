@@ -1,14 +1,28 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 
 export default function Navbar() {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   const toggleMenu = () => {
-    setIsMenuOpen(!isMenuOpen);
+    setIsMenuOpen((prev) => !prev);
   };
+
+  // Close on Escape and return focus to the trigger button
+  useEffect(() => {
+    if (!isMenuOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setIsMenuOpen(false);
+        triggerRef.current?.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [isMenuOpen]);
 
   const navLinks = [
     { href: "/", label: "Home" },
@@ -43,9 +57,12 @@ export default function Navbar() {
 
           {/* Mobile Menu Button */}
           <button
+            ref={triggerRef}
             onClick={toggleMenu}
             className="flex flex-col gap-1.5 md:hidden"
             aria-label="Toggle menu"
+            aria-expanded={isMenuOpen}
+            aria-controls="mobile-nav-menu"
           >
             <span
               className={`block h-0.5 w-6 bg-white transition-all ${
@@ -65,23 +82,26 @@ export default function Navbar() {
           </button>
         </div>
 
-        {/* Mobile Menu */}
-        {isMenuOpen && (
-          <div className="border-t border-white/10 py-4 md:hidden">
-            <div className="flex flex-col gap-4">
-              {navLinks.map((link) => (
-                <Link
-                  key={link.href}
-                  href={link.href}
-                  onClick={() => setIsMenuOpen(false)}
-                  className="text-sm text-slate-300 transition-colors hover:text-white"
-                >
-                  {link.label}
-                </Link>
-              ))}
-            </div>
+        {/* Mobile Menu — uses hidden attribute so the panel stays in DOM for
+            reliable aria-controls reference; visibility is controlled via CSS */}
+        <div
+          id="mobile-nav-menu"
+          hidden={!isMenuOpen}
+          className="border-t border-white/10 py-4 md:hidden"
+        >
+          <div className="flex flex-col gap-4">
+            {navLinks.map((link) => (
+              <Link
+                key={link.href}
+                href={link.href}
+                onClick={() => setIsMenuOpen(false)}
+                className="text-sm text-slate-300 transition-colors hover:text-white"
+              >
+                {link.label}
+              </Link>
+            ))}
           </div>
-        )}
+        </div>
       </div>
     </nav>
   );

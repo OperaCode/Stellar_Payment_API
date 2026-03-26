@@ -32,7 +32,10 @@ Sentry.init({
   // Capture context for better debugging
   beforeSendTransaction(transaction) {
     // Add custom context to transactions
-    transaction.setTag("component", "frontend");
+    transaction.tags = {
+      ...transaction.tags,
+      component: "frontend"
+    };
     return transaction;
   },
 });

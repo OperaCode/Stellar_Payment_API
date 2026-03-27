@@ -11,8 +11,11 @@ import { supabase } from "../lib/supabase.js";
 import { validateUuidParam } from "../lib/validate-uuid.js";
 import {
   paymentSessionZodSchema,
-  parseVersionedPaymentBody,
+  paginationQuerySchema,
+  refundConfirmSchema,
+  pathPaymentQuoteQuerySchema
 } from "../lib/request-schemas.js";
+import { validateRequest } from "../lib/validation.js";
 import { createCreatePaymentRateLimit } from "../lib/create-payment-rate-limit.js";
 import { sendWebhook } from "../lib/webhooks.js";
 import { sendReceiptEmail } from "../lib/email.js";
@@ -131,7 +134,7 @@ function createPaymentsRouter({
    */
   async function createSession(req, res, next) {
     try {
-      const body = parseVersionedPaymentBody(req);
+      const body = req.body;
 
       // Per-asset payment limit validation (#153)
       const limits = req.merchant.payment_limits;
@@ -226,8 +229,8 @@ function createPaymentsRouter({
     }
   }
 
-  router.post("/create-payment", createPaymentRateLimit, createSession);
-  router.post("/sessions", createPaymentRateLimit, createSession);
+  router.post("/create-payment", createPaymentRateLimit, validateRequest({ body: paymentSessionZodSchema }), createSession);
+  router.post("/sessions", createPaymentRateLimit, validateRequest({ body: paymentSessionZodSchema }), createSession);
 
   /**
    * @swagger
@@ -523,14 +526,10 @@ const webhookResult = await sendWebhook(
    *       401:
    *         description: Missing or invalid API key
    */
-  router.get("/payments", async (req, res, next) => {
+  router.get("/payments", validateRequest({ query: paginationQuerySchema }), async (req, res, next) => {
     try {
-      let page = parseInt(req.query.page, 10) || 1;
-      let limit = parseInt(req.query.limit, 10) || 10;
-
-      if (page < 1) page = 1;
-      if (limit < 1) limit = 1;
-      if (limit > 100) limit = 100;
+      let page = req.query.page;
+      let limit = req.query.limit;
 
       const offset = (page - 1) * limit;
 
@@ -832,13 +831,10 @@ const webhookResult = await sendWebhook(
   router.post(
     "/payments/:id/refund/confirm",
     validateUuidParam(),
+    validateRequest({ body: refundConfirmSchema }),
     async (req, res, next) => {
       try {
         const { tx_hash } = req.body;
-
-        if (!tx_hash) {
-          return res.status(400).json({ error: "Transaction hash required" });
-        }
 
         const { data: payment, error } = await supabase
           .from("payments")
@@ -921,18 +917,12 @@ const webhookResult = await sendWebhook(
   router.get(
     "/path-payment-quote/:id",
     validateUuidParam(),
+    validateRequest({ query: pathPaymentQuoteQuerySchema }),
     async (req, res, next) => {
       try {
         const sourceAsset = req.query.source_asset;
         const sourceAssetIssuer = req.query.source_asset_issuer || null;
         const sourceAccount = req.query.source_account;
-
-        if (!sourceAsset || !sourceAccount) {
-          return res.status(400).json({
-            error:
-              "source_asset and source_account query parameters are required",
-          });
-        }
 
         let query = supabase
           .from("payments")

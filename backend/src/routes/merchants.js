@@ -1,17 +1,43 @@
 import express from "express";
 import { randomBytes } from "crypto";
-import { z } from "zod";
 import { supabase } from "../lib/supabase.js";
+import { requireApiKeyAuth } from "../lib/auth.js";
+import { getMerchantApiUsage } from "../lib/api-usage.js";
 import {
-  merchantProfileUpdateZodSchema,
   registerMerchantZodSchema,
   sessionBrandingSchema,
+  webhookSettingsSchema,
 } from "../lib/request-schemas.js";
 import { resolveBrandingConfig } from "../lib/branding.js";
 import { resolveMerchantSettings } from "../lib/merchant-settings.js";
 import { sendWebhook } from "../lib/webhooks.js";
+import { getPayloadForVersion } from "../webhooks/resolver.js";
 
 const router = express.Router();
+
+const DEFAULT_WEBHOOK_SECRET_ROTATION_GRACE_HOURS = 24;
+
+const rotateWebhookSecretSchema = z.object({
+  grace_period_hours: z.number().int().min(0).max(168).optional(),
+});
+
+function resolveWebhookSecretRotationGraceHours(requestValue) {
+  if (typeof requestValue === "number") {
+    return requestValue;
+  }
+
+  const envValue = process.env.WEBHOOK_SECRET_ROTATION_GRACE_HOURS;
+  if (envValue === undefined) {
+    return DEFAULT_WEBHOOK_SECRET_ROTATION_GRACE_HOURS;
+  }
+
+  const parsed = Number.parseInt(envValue, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_WEBHOOK_SECRET_ROTATION_GRACE_HOURS;
+  }
+
+  return Math.min(parsed, 168);
+}
 
 /**
  * @swagger
@@ -161,6 +187,77 @@ router.post("/rotate-key", async (req, res, next) => {
   }
 });
 
+/**
+ * @swagger
+ * /api/merchants/rotate-webhook-secret:
+ *   post:
+ *     summary: Rotate the authenticated merchant's webhook signing secret
+ *     tags: [Merchants]
+ *     security:
+ *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               grace_period_hours:
+ *                 type: integer
+ *                 minimum: 0
+ *                 maximum: 168
+ *                 description: Optional override for old-secret grace period in hours (default 24)
+ *     responses:
+ *       200:
+ *         description: New webhook secret issued; old secret remains valid until expiry
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 webhook_secret:
+ *                   type: string
+ *                 webhook_secret_old_expires_at:
+ *                   type: string
+ *                   format: date-time
+ *                 grace_period_hours:
+ *                   type: integer
+ */
+router.post("/merchants/rotate-webhook-secret", async (req, res, next) => {
+  try {
+    const body = rotateWebhookSecretSchema.parse(req.body || {});
+    const graceHours = resolveWebhookSecretRotationGraceHours(
+      body.grace_period_hours,
+    );
+    const now = Date.now();
+    const expiryIso = new Date(now + graceHours * 60 * 60 * 1000).toISOString();
+
+    const newWebhookSecret = `whsec_${randomBytes(32).toString("hex")}`;
+
+    const { error } = await supabase
+      .from("merchants")
+      .update({
+        webhook_secret_old: req.merchant.webhook_secret,
+        webhook_secret_expiry: expiryIso,
+        webhook_secret: newWebhookSecret,
+      })
+      .eq("id", req.merchant.id);
+
+    if (error) {
+      error.status = 500;
+      throw error;
+    }
+
+    res.json({
+      webhook_secret: newWebhookSecret,
+      webhook_secret_old_expires_at: expiryIso,
+      grace_period_hours: graceHours,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get("/merchant-branding", async (req, res, next) => {
   try {
     const { data, error } = await supabase
@@ -206,6 +303,7 @@ router.put("/merchant-branding", async (req, res, next) => {
     next(err);
   }
 });
+// ─── Webhook Settings ────────────────────────────────────────────────────────
 
 router.get("/merchant-profile", async (req, res, next) => {
   try {
@@ -245,33 +343,6 @@ router.get("/merchant-profile", async (req, res, next) => {
  *     tags: [Merchants]
  *     security:
  *       - ApiKeyAuth: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [webhook_url]
- *             properties:
- *               webhook_url:
- *                 type: string
- *                 format: uri
- *     responses:
- *       200:
- *         description: Ping result from the target server
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 ok:
- *                   type: boolean
- *                 status:
- *                   type: integer
- *                 body:
- *                   type: string
- *       400:
- *         description: Missing or invalid webhook_url
  */
 router.post("/test-webhook", async (req, res, next) => {
   try {
@@ -286,13 +357,18 @@ router.post("/test-webhook", async (req, res, next) => {
       return res.status(400).json({ error: "webhook_url must be a valid URL" });
     }
 
-    const result = await sendWebhook(
-      webhook_url,
+    const payload = getPayloadForVersion(
+      req.merchant.webhook_version || "v1",
+      "ping",
       {
-        event: "ping",
         merchant_id: req.merchant.id,
         timestamp: new Date().toISOString(),
-      },
+      }
+    );
+
+    const result = await sendWebhook(
+      webhook_url,
+      payload,
       req.merchant.webhook_secret || null
     );
 
@@ -316,61 +392,24 @@ const paymentLimitsSchema = z
     })
   )
   .optional();
-
 /**
  * @swagger
- * /api/merchant-limits:
+ * /api/webhook-settings:
  *   get:
- *     summary: Get per-asset payment limits for the authenticated merchant
+ *     summary: Retrieve current webhook URL and masked webhook secret
  *     tags: [Merchants]
  *     security:
  *       - ApiKeyAuth: []
  *     responses:
  *       200:
- *         description: Current payment limits config
+ *         description: Current webhook settings
  */
-router.get("/merchant-limits", async (req, res, next) => {
+router.get("/webhook-settings", async (req, res, next) => {
   try {
     const { data, error } = await supabase
       .from("merchants")
-      .select("payment_limits")
+      .select("webhook_url, webhook_secret")
       .eq("id", req.merchant.id)
-      .maybeSingle();
-
-    if (error) {
-      error.status = 500;
-      throw error;
-    }
-
-    res.json({ payment_limits: data?.payment_limits ?? {} });
-  } catch (err) {
-    next(err);
-  }
-});
-
-router.put("/merchant-profile", async (req, res, next) => {
-  try {
-    const body = merchantProfileUpdateZodSchema.parse(req.body || {});
-    const updatePayload = {};
-
-    if (body.notification_email !== undefined) {
-      updatePayload.notification_email = body.notification_email;
-    }
-
-    if (body.merchant_settings !== undefined) {
-      updatePayload.merchant_settings = resolveMerchantSettings({
-        ...req.merchant.merchant_settings,
-        ...body.merchant_settings,
-      });
-    }
-
-    const { data, error } = await supabase
-      .from("merchants")
-      .update(updatePayload)
-      .eq("id", req.merchant.id)
-      .select(
-        "id, email, business_name, notification_email, merchant_settings, created_at",
-      )
       .single();
 
     if (error) {
@@ -378,11 +417,16 @@ router.put("/merchant-profile", async (req, res, next) => {
       throw error;
     }
 
+    // Mask the secret: show first 10 chars, hide the rest
+    const secret = data.webhook_secret || "";
+    const maskedSecret =
+      secret.length > 10
+        ? secret.slice(0, 10) + "•".repeat(secret.length - 10)
+        : "•".repeat(secret.length);
+
     res.json({
-      merchant: {
-        ...data,
-        merchant_settings: resolveMerchantSettings(data.merchant_settings),
-      },
+      webhook_url: data.webhook_url || "",
+      webhook_secret_masked: maskedSecret,
     });
   } catch (err) {
     next(err);
@@ -391,10 +435,10 @@ router.put("/merchant-profile", async (req, res, next) => {
 
 /**
  * @swagger
- * /api/merchant-limits:
+ * /api/webhook-settings:
  *   put:
- *     summary: Set per-asset payment limits for the authenticated merchant
- *   tags: [Merchants]
+ *     summary: Update the merchant's webhook endpoint URL
+ *     tags: [Merchants]
  *     security:
  *       - ApiKeyAuth: []
  *     requestBody:
@@ -403,26 +447,25 @@ router.put("/merchant-profile", async (req, res, next) => {
  *         application/json:
  *           schema:
  *             type: object
- *             additionalProperties:
- *               type: object
- *               properties:
- *                 min:
- *                   type: number
- *                 max:
- *                   type: number
+ *             properties:
+ *               webhook_url:
+ *                 type: string
+ *                 format: uri
  *     responses:
  *       200:
- *         description: Updated payment limits
+ *         description: Webhook URL updated
+ *       400:
+ *         description: Validation error
  */
-router.put("/merchant-limits", async (req, res, next) => {
+router.put("/webhook-settings", async (req, res, next) => {
   try {
-    const limits = paymentLimitsSchema.parse(req.body || {});
+    const body = webhookSettingsSchema.parse(req.body || {});
 
     const { data, error } = await supabase
       .from("merchants")
-      .update({ payment_limits: limits ?? {} })
+      .update({ webhook_url: body.webhook_url || null })
       .eq("id", req.merchant.id)
-      .select("payment_limits")
+      .select("webhook_url")
       .single();
 
     if (error) {
@@ -430,7 +473,42 @@ router.put("/merchant-limits", async (req, res, next) => {
       throw error;
     }
 
-    res.json({ payment_limits: data.payment_limits });
+    res.json({ webhook_url: data.webhook_url || "" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * @swagger
+ * /api/regenerate-webhook-secret:
+ *   post:
+ *     summary: Regenerate the merchant's webhook signing secret
+ *     tags: [Merchants]
+ *     security:
+ *       - ApiKeyAuth: []
+ *     responses:
+ *       200:
+ *         description: New webhook secret issued
+ *       401:
+ *         description: Missing or invalid x-api-key header
+ */
+router.post("/regenerate-webhook-secret", async (req, res, next) => {
+  try {
+    const newSecret = `whsec_${randomBytes(24).toString("hex")}`;
+
+    const { error } = await supabase
+      .from("merchants")
+      .update({ webhook_secret: newSecret })
+      .eq("id", req.merchant.id);
+
+    if (month && !/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+      return res.status(400).json({
+        error: "month must be in YYYY-MM format",
+      });
+    }
+
+    res.json({ webhook_secret: newSecret });
   } catch (err) {
     next(err);
   }

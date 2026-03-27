@@ -25,4 +25,4 @@ export function localeToLanguageTag(locale: string): string {
     default:
       return "en-US";
   }
-}
+};

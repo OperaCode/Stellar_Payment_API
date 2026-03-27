@@ -22,6 +22,7 @@ import { setupSentryErrorHandler } from "./lib/sentry.js";
 import {
   createRedisRateLimitStore,
   createVerifyPaymentRateLimit,
+  createMerchantRegistrationRateLimit,
 } from "./lib/rate-limit.js";
 
 export async function createApp({ redisClient }) {
@@ -117,6 +118,10 @@ export async function createApp({ redisClient }) {
     store: createRedisRateLimitStore({ client: redisClient }),
   });
 
+  const merchantRegistrationRateLimit = createMerchantRegistrationRateLimit({
+    store: createRedisRateLimitStore({ client: redisClient }),
+  });
+
   app.use("/api/create-payment", requireApiKeyAuth());
   app.use("/api/create-payment", idempotencyMiddleware);
   app.use("/api/sessions", requireApiKeyAuth());
@@ -127,7 +132,7 @@ export async function createApp({ redisClient }) {
   app.use("/api/webhooks", requireApiKeyAuth());
 
   app.use("/api", createPaymentsRouter({ verifyPaymentRateLimit }));
-  app.use("/api", merchantsRouter);
+  app.use("/api", createMerchantsRouter({ merchantRegistrationRateLimit }));
   app.use("/api", metricsRouter);
   app.use("/api", webhooksRouter);
 

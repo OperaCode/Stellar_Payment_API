@@ -13,7 +13,7 @@ import Skeleton, { SkeletonTheme } from "react-loading-skeleton";
 import "react-loading-skeleton/dist/skeleton.css";
 import { QRCodeSVG } from "qrcode.react";
 import { localeToLanguageTag } from "@/i18n/config";
-import { Spinner } from "@/components/ui/Spinner";
+import Confetti from "react-confetti";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
 
@@ -62,6 +62,18 @@ interface PaymentDetails {
   tx_id: string | null;
   created_at: string;
   branding_config?: BrandingConfig | null;
+}
+
+interface PathQuote {
+  source_asset: string;
+  source_asset_issuer: string | null;
+  source_amount: string;
+  send_max: string;
+  destination_asset: string;
+  destination_asset_issuer: string | null;
+  destination_amount: string;
+  path: Array<{ asset_code: string; asset_issuer: string | null }>;
+  slippage: number;
 }
 
 // ─── Branding defaults ───────────────────────────────────────────────────────
@@ -354,19 +366,17 @@ export default function PaymentPage() {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [showRawIntent, setShowRawIntent] = useState(false);
+  const [showConfetti, setShowConfetti] = useState(false);
+
+  useEffect(() => {
+    if (payment && (payment.status === "confirmed" || payment.status === "completed")) {
+      setShowConfetti(true);
+    }
+  }, [payment?.status]);
 
   // Path payment state
   const [usePathPayment, setUsePathPayment] = useState(false);
-  const [pathQuote, setPathQuote] = useState<{
-    source_asset: string;
-    source_asset_issuer: string | null;
-    source_amount: string;
-    send_max: string;
-    destination_asset: string;
-    destination_amount: string;
-    path: Array<{ asset_code: string; asset_issuer: string | null }>;
-    slippage: number;
-  } | null>(null);
+  const [pathQuote, setPathQuote] = useState<PathQuote | null>(null);
   const [pathQuoteLoading, setPathQuoteLoading] = useState(false);
   const [pathQuoteError, setPathQuoteError] = useState<string | null>(null);
 
@@ -425,14 +435,20 @@ export default function PaymentPage() {
       } catch {
         /* silent — retry next tick */
       }
-    }, 5000);
+    }, 3000);
 
     return () => clearInterval(id);
   }, [paymentId, payment, loading]);
 
   // ── Fetch path payment quote when wallet is connected ────────────────────
   useEffect(() => {
-    if (!payment || !activeProvider || payment.status !== "pending") return;
+    if (!payment || !activeProvider || payment.status !== "pending") {
+      setPathQuote(null);
+      setPathQuoteError(null);
+      setPathQuoteLoading(false);
+      setUsePathPayment(false);
+      return;
+    }
 
     let cancelled = false;
     (async () => {
@@ -449,14 +465,23 @@ export default function PaymentPage() {
           `${API_URL}/api/path-payment-quote/${paymentId}?${qs}`,
         );
         if (!res.ok) {
-          setPathQuote(null);
+          if (!cancelled) {
+            setPathQuote(null);
+            setUsePathPayment(false);
+          }
           return;
         }
-        const data = await res.json();
-        if (!cancelled) setPathQuote(data);
+        const data = (await res.json()) as PathQuote;
+        if (!cancelled) {
+          setPathQuote(data);
+          setUsePathPayment(true);
+        }
       } catch {
-        if (!cancelled)
+        if (!cancelled) {
+          setPathQuote(null);
+          setUsePathPayment(false);
           setPathQuoteError("Could not fetch path payment quote.");
+        }
       } finally {
         if (!cancelled) setPathQuoteLoading(false);
       }
@@ -479,11 +504,13 @@ export default function PaymentPage() {
           recipient: payment.recipient,
           destAmount: pathQuote.destination_amount,
           destAssetCode: pathQuote.destination_asset,
-          destAssetIssuer: payment.asset_issuer,
+          destAssetIssuer: pathQuote.destination_asset_issuer,
           sendMax: pathQuote.send_max,
           sendAssetCode: pathQuote.source_asset,
           sendAssetIssuer: pathQuote.source_asset_issuer,
           path: pathQuote.path,
+          memo: payment.memo,
+          memoType: payment.memo_type,
         });
       } else {
         result = await processPayment({
@@ -491,6 +518,8 @@ export default function PaymentPage() {
           amount: String(payment.amount),
           assetCode: payment.asset,
           assetIssuer: payment.asset_issuer,
+          memo: payment.memo,
+          memoType: payment.memo_type,
         });
       }
 
@@ -542,6 +571,11 @@ export default function PaymentPage() {
 
   return (
     <>
+      {showConfetti && (
+        <div style={{ position: "fixed", top: 0, left: 0, width: "100%", height: "100%", zIndex: 100, pointerEvents: "none" }}>
+          <Confetti recycle={false} numberOfPieces={400} />
+        </div>
+      )}
       {/* ── Full-screen processing overlay ── */}
       {isProcessing && (
         <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-5 bg-black/85 backdrop-blur-sm">
@@ -711,6 +745,41 @@ export default function PaymentPage() {
                       })}
                     </p>
 
+                    {pathQuote && !pathQuoteLoading && (
+                      <div className="rounded-2xl border border-white/10 bg-black/30 p-4">
+                        <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
+                          {t("approximateCostLabel")}
+                        </p>
+                        <div className="mt-2 flex items-end justify-between gap-4">
+                          <div>
+                            <p className="text-2xl font-bold text-white">
+                              {Number(pathQuote.source_amount).toLocaleString(
+                                locale,
+                                {
+                                  minimumFractionDigits: 0,
+                                  maximumFractionDigits: 7,
+                                }
+                              )}{" "}
+                              {pathQuote.source_asset}
+                            </p>
+                            <p className="mt-1 text-xs text-slate-500">
+                              {t("approximateCostHelp", {
+                                amount: pathQuote.destination_amount,
+                                asset: pathQuote.destination_asset,
+                              })}
+                            </p>
+                          </div>
+                          <p className="text-right text-xs text-slate-500">
+                            {t("slippageBuffer", {
+                              percent: Math.round(pathQuote.slippage * 100),
+                              sendMax: pathQuote.send_max,
+                              asset: pathQuote.source_asset,
+                            })}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
                     {/* Path payment toggle */}
                     {pathQuote && !pathQuoteLoading && (
                       <label className="flex items-center gap-3 rounded-xl border border-white/10 bg-black/30 px-4 py-3 cursor-pointer select-none">
@@ -722,11 +791,11 @@ export default function PaymentPage() {
                           style={{ accentColor: "var(--checkout-primary)" }}
                         />
                         <span className="text-sm text-slate-300">
-                          Pay with{" "}
+                          {t("pathPaymentTogglePrefix")}{" "}
                           <span className="font-semibold text-white">
-                            {pathQuote.send_max} {pathQuote.source_asset}
+                            {pathQuote.source_amount} {pathQuote.source_asset}
                           </span>{" "}
-                          instead
+                          {t("pathPaymentToggleSuffix")}
                         </span>
                       </label>
                     )}

@@ -34,6 +34,7 @@ const setApiKeyExpirySchema = z.object({
  * /api/register-merchant:
  *   post:
  *     summary: Register a new merchant
+ *     description: Create a new merchant account and receive API key and webhook secret credentials
  *     tags: [Merchants]
  */
 router.post("/register-merchant", async (req, res, next) => {
